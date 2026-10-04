@@ -13,6 +13,7 @@ import threading
 
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
+from .audit.replay import build_aligned_replay
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
 from .errors import PlantError
@@ -41,6 +42,7 @@ from .station.batch import build_plan
 from .station.mapping import StationMapping
 from .station.service import CancelToken, StationService
 from .station.station import HeatStation
+from .store.chain import backfill_segments, read_segment_verified, verify_journal
 from .store.command import CommandCheckpoint
 from .store.jsonfile import JsonStore
 from .store.journal import JsonlJournal
@@ -75,6 +77,7 @@ class Platform:
         config: PlatformConfig | None = None,
         clock: Clock | None = None,
         unit: str = DEFAULT_UNIT,
+        audit_segment_limit: int = 512,
     ) -> None:
         self.config = config or default_config()
         self.clock = clock or SystemClock()
@@ -87,7 +90,7 @@ class Platform:
         self.durable = DurableState(store)
         self.checkpoint = CommandCheckpoint(store)
         self.audit = AuditLog(
-            self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
+            self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=audit_segment_limit)
         )
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
@@ -714,6 +717,106 @@ class Platform:
             "ok": not mixed and abs(delta - expected) < 1e-9,
         }
 
+    # ---- 流水校验与回放 -----------------------------------------------
+
+    def verify_journal(self) -> dict:
+        """校验审计流水的分段链，结果落一条审计后返回。"""
+
+        with self._lock:
+            report = verify_journal(self.audit.journal)
+            ok = report["ok"]
+            self.audit.record(
+                AuditRecord.create(
+                    self.clock.now(),
+                    "",
+                    "audit",
+                    "journal_verify",
+                    severity="notice" if ok else "warning",
+                    message="流水链校验通过" if ok else "流水链校验未通过",
+                    segments_on_disk=report["segments_on_disk"],
+                    missing=list(report["missing"]),
+                    tampered=list(report["tampered"]),
+                    unsealed=list(report["unsealed"]),
+                    broken_links=list(report["broken_links"]),
+                )
+            )
+            return report
+
+    def read_journal_segment(self, index: int, policy: str = "strict") -> dict:
+        """按策略读取一段流水：strict 校验不过整段拒读，marked 标上问题后部分读。"""
+
+        return read_segment_verified(self.audit.journal, int(index), policy)
+
+    def backfill_journal(self, fills: dict, continue_on_error: bool = False) -> dict:
+        """按段号升序补齐缺失段；补了什么、依据哪段校验值，逐段落审计。
+
+        补齐是部分失败语义：``continue_on_error`` 为假时首个失败即停（判退），
+        为真时继续补后续段（判进）；并发补同一段的后到者判为重复。
+        """
+
+        with self._lock:
+            report = backfill_segments(
+                self.audit.journal, fills, continue_on_error=continue_on_error
+            )
+            for group in ("filled", "failed", "duplicates"):
+                for entry in report[group]:
+                    self.audit.record(
+                        AuditRecord.create(
+                            self.clock.now(),
+                            "",
+                            "audit",
+                            "journal_backfill",
+                            severity="notice" if entry["result"] == "filled" else "warning",
+                            message=f"段 {entry['segment']} 补齐结果：{entry['result']}",
+                            **entry,
+                        )
+                    )
+            ok = report["ok"]
+            self.audit.record(
+                AuditRecord.create(
+                    self.clock.now(),
+                    "",
+                    "audit",
+                    "journal_backfill_summary",
+                    severity="notice" if ok else "warning",
+                    message="补齐完成" if ok else "补齐未全部完成",
+                    filled=len(report["filled"]),
+                    failed=len(report["failed"]),
+                    duplicates=len(report["duplicates"]),
+                    skipped=len(report["skipped"]),
+                    partial=report["partial"],
+                    aborted=report["aborted"],
+                )
+            )
+            return report
+
+    def aligned_replay(self, slot_s: float | None = None, limit: int = 240) -> dict:
+        """把审计与趋势按同一条时间轴对齐合并，结果供控制台展示并落审计。"""
+
+        with self._lock:
+            width = self.trend.period_s if slot_s is None else float(slot_s)
+            records = self.audit.records(limit=limit)
+            series = {
+                signal: self.trend.series(signal, limit=limit)
+                for signal in self.trend.signals()
+            }
+            replay = build_aligned_replay(records, series, width)
+            self.audit.record(
+                AuditRecord.create(
+                    self.clock.now(),
+                    "",
+                    "audit",
+                    "aligned_replay",
+                    severity="notice",
+                    message="对齐回放已生成",
+                    slot_s=replay["slot_s"],
+                    slots=len(replay["slots"]),
+                    audits=replay["audits"],
+                    trend_points=replay["trend_points"],
+                )
+            )
+            return replay
+
     # ---- 查询 ---------------------------------------------------------
 
     def meter_names(self) -> list[str]:
@@ -861,10 +964,11 @@ def build_platform(
     clock: Clock | None = None,
     storage_root: str | None = None,
     unit: str = DEFAULT_UNIT,
+    audit_segment_limit: int = 512,
 ) -> Platform:
     """构造一个平台；``storage_root`` 可覆盖配置里的存储目录。"""
 
     base = config or default_config()
     if storage_root is not None:
         base = dataclasses.replace(base, storage_root=storage_root)
-    return Platform(base, clock=clock, unit=unit)
+    return Platform(base, clock=clock, unit=unit, audit_segment_limit=audit_segment_limit)

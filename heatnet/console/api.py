@@ -56,6 +56,10 @@ class Api:
         add("GET", "/api/alarms", self._alarms)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/journal/verify", lambda params, body: self._platform.verify_journal())
+        add("GET", "/api/journal/segment/{index}", self._journal_segment)
+        add("POST", "/api/journal/backfill", self._journal_backfill)
+        add("GET", "/api/replay", self._aligned_replay)
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/weather", self._weather)
@@ -222,6 +226,27 @@ class Api:
         if segment is not None:
             payload["records"] = self._platform.audit.replay_segment(int(segment))
         return payload
+
+    def _journal_segment(self, params: dict, body: dict) -> dict:
+        return self._platform.read_journal_segment(
+            int(params.get("index", "0")), str(params.get("policy", "strict"))
+        )
+
+    def _journal_backfill(self, params: dict, body: dict) -> dict:
+        raw = body.get("segments")
+        if not isinstance(raw, dict) or not raw:
+            raise ValueError("segments 必须是非空映射")
+        fills = {int(index): records for index, records in raw.items()}
+        return self._platform.backfill_journal(
+            fills, continue_on_error=bool(body.get("continue_on_error", False))
+        )
+
+    def _aligned_replay(self, params: dict, body: dict) -> dict:
+        slot = params.get("slot_s")
+        return self._platform.aligned_replay(
+            slot_s=None if slot is None else float(slot),
+            limit=int(params.get("limit", 240)),
+        )
 
     def _store(self, params: dict, body: dict) -> dict:
         return {
