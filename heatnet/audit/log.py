@@ -11,6 +11,7 @@ import threading
 
 from ..clock import Clock
 from ..eventbus import Event, EventBus
+from ..store.chain import POLICY_MARK, POLICY_STRICT, ChainReport, SegmentChainGuard
 from ..store.journal import JsonlJournal
 from .record import AuditRecord
 from .report import summarize
@@ -28,6 +29,7 @@ class AuditLog:
     ) -> None:
         self._clock = clock
         self._journal = journal
+        self.chain = SegmentChainGuard(journal)
         self._entries: list[AuditRecord] = []
         self._memory_limit = max(1, memory_limit)
         self._lock = threading.RLock()
@@ -108,10 +110,34 @@ class AuditLog:
         return report
 
     def replay_from_journal(self, limit: int = 100_000) -> list[dict]:
-        """从落盘流水回放记录，供跨重启恢复使用。"""
+        """标注读法回放落盘流水：好段原样返回，坏段记录带标记、缺段给占位。
 
-        records = self._journal.read_all()
-        return records[-limit:]
+        恢复用途需要整段拒读时走 :meth:`replay_verified` 的严格读法。
+        """
+
+        records, _report = self.chain.read_verified(POLICY_MARK, limit=limit)
+        return records
+
+    def replay_verified(
+        self, policy: str = POLICY_STRICT, limit: int | None = None
+    ) -> tuple[list[dict], ChainReport]:
+        """按策略跨段校验后回放：``strict`` 整段拒读，``mark`` 标注后部分读。"""
+
+        return self.chain.read_verified(policy, limit=limit)
+
+    def chain_report(self) -> dict:
+        """返回审计流水的跨段校验结论。"""
+
+        return self.chain.verify().as_dict()
+
+    def backfill_segment(
+        self, index: int, records: list[dict], *, operator: str = "console"
+    ) -> dict:
+        """补齐审计流水的缺失段，顺序/锚点/重复由链校验器判死。"""
+
+        return self.chain.backfill_segment(
+            index, records, operator=operator, now=self._clock.now
+        )
 
     def replay_segment(self, index: int) -> list[dict]:
         """按段号回放一段流水。"""

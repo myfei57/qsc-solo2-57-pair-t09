@@ -39,6 +39,14 @@ class StorageError(PlantError):
     """持久化读写失败。"""
 
 
+class IntegrityError(StorageError):
+    """流水段跨段校验不过：缺段、被改或补段锚点对不上。
+
+    严格读法（恢复用途）下直接抛出，表示整段拒读；标注读法（控制台复盘）
+    不抛此异常，而是把坏段状态标在记录上继续返回。
+    """
+
+
 class ConfigError(PlantError):
     """配置缺失或取值非法。"""
 

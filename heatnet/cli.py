@@ -7,6 +7,7 @@
             控制周期 → 流量标定 → 定压改造 → 二次网循环 → 热量采集与结算 →
             分区拆分 → 阀门队列回放 → 停机与复位），用于交付前的真实运行检查；
 ``status``  打印当前状态快照；
+``replay``  按同一条时间轴同轴回放审计与趋势，可选严格读法并只看最近若干条；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
 """
@@ -161,6 +162,26 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_replay(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    aligned = platform.replay_aligned(
+        "strict" if args.strict else "mark", limit=args.limit
+    )
+    payload: dict = {
+        "alignment": aligned["alignment"],
+        "policy": aligned["policy"],
+        "decision": aligned["decision"],
+        "ok": aligned["ok"],
+        "coverage": aligned["coverage"],
+        "tracks": aligned["tracks"],
+        "timeline": aligned["timeline"][-args.window :],
+    }
+    _dump(payload)
+    if args.strict and not aligned["ok"]:
+        return 1
+    return 0
+
+
 def _cmd_config(args: argparse.Namespace) -> int:
     config_path = getattr(args, "config", None)
     config = load_config(config_path) if config_path else default_config()
@@ -213,6 +234,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="打印状态快照", parents=[common])
     status.set_defaults(func=_cmd_status)
+
+    replay = sub.add_parser("replay", help="同轴回放审计与趋势", parents=[common])
+    replay.add_argument("--strict", action="store_true", help="严格读法：缺段改段整段拒读")
+    replay.add_argument("--limit", type=int, default=100_000, help="每条轴最多回放多少条")
+    replay.add_argument("--window", type=int, default=200, help="打印时间轴末尾多少步")
+    replay.set_defaults(func=_cmd_replay)
 
     config = sub.add_parser("config", help="打印生效配置", parents=[common])
     config.set_defaults(func=_cmd_config)

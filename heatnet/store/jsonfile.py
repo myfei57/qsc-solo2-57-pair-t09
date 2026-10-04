@@ -92,13 +92,16 @@ class JsonStore:
             return True
 
     def list_ids(self) -> list[str]:
-        """列出全部文档标识（相对根目录、去扩展名、排序后）。"""
+        """列出全部文档标识（相对根目录、去扩展名、排序后）。
+
+        流水段的链清单旁车（``*.chain.json``）不是当前态文档，统一排除。
+        """
 
         with self._lock:
             found: list[str] = []
             for base, _dirs, files in os.walk(self._root):
                 for name in files:
-                    if not name.endswith(".json"):
+                    if not name.endswith(".json") or name.endswith(".chain.json"):
                         continue
                     full = os.path.join(base, name)
                     relative = os.path.relpath(full, self._root)

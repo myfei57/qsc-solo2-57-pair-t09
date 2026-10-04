@@ -3,12 +3,19 @@
 现场采样可能因为机械动作被抢占而丢点，控制台要展示的是按固定周期对齐的趋势
 而不是原始采样流。:class:`TrendBuffer` 按信号名收集样本，并可对缺失周期做线性
 补点，供状态查询与审计回放共用。
+
+内存里的趋势进程一退就没，事后复盘只能靠人拿内存截图对审计。因此追加样本时
+可选地把每个点交给 ``sink`` 落盘（平台里挂的是带跨段校验链的趋势流水），
+``sink`` 在锁外调用，落盘 fsync 不阻塞采样侧的其它读取。
 """
 
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from typing import Callable
+
+TrendSink = Callable[[str, float, float], None]
 
 
 @dataclass(frozen=True)
@@ -25,10 +32,16 @@ class Sample:
 class TrendBuffer:
     """按信号名保存有限长度的趋势样本。"""
 
-    def __init__(self, limit: int = 2048, period_s: float = 5.0) -> None:
+    def __init__(
+        self,
+        limit: int = 2048,
+        period_s: float = 5.0,
+        sink: TrendSink | None = None,
+    ) -> None:
         self._series: dict[str, list[Sample]] = {}
         self._limit = max(1, limit)
         self._period_s = max(0.001, period_s)
+        self._sink = sink
         self._lock = threading.RLock()
 
     @property
@@ -36,13 +49,16 @@ class TrendBuffer:
         return self._period_s
 
     def append(self, signal: str, ts: float, value: float) -> None:
-        """追加一个采样点，超出上限时丢弃最旧的样本。"""
+        """追加一个采样点，超出上限时丢弃最旧的样本，并同步交给落盘 sink。"""
 
         with self._lock:
             series = self._series.setdefault(signal, [])
             series.append(Sample(ts, float(value)))
             if len(series) > self._limit:
                 del series[: len(series) - self._limit]
+            sink = self._sink
+        if sink is not None:
+            sink(signal, ts, float(value))
 
     def latest(self, signal: str) -> Sample | None:
         """返回某信号的最后一个样本。"""

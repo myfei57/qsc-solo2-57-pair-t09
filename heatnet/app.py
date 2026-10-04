@@ -42,10 +42,12 @@ from .station.mapping import StationMapping
 from .station.service import CancelToken, StationService
 from .station.station import HeatStation
 from .store.command import CommandCheckpoint
+from .store.chain import POLICY_MARK, POLICY_STRICT, SegmentChainGuard
 from .store.jsonfile import JsonStore
 from .store.journal import JsonlJournal
 from .store.metrics import StoreMetrics
 from .store.state import DurableState
+from .audit.replay import build_aligned_replay, parse_audit
 from .temp.curve import HeatCurve
 from .temp.forecast import build_forecast, describe_forecast
 from .telemetry import TrendBuffer
@@ -89,9 +91,13 @@ class Platform:
         self.audit = AuditLog(
             self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
         )
+        self.trend_journal = JsonlJournal(store.root, "trend", segment_limit=512)
+        self.trend_chain = SegmentChainGuard(self.trend_journal)
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
-        self.trend = TrendBuffer(period_s=self.config.quota.sample_period_s)
+        self.trend = TrendBuffer(
+            period_s=self.config.quota.sample_period_s, sink=self._persist_trend_sample
+        )
         self.ids = IdFactory("op")
 
         self.zones = ZoneRegistry()
@@ -194,7 +200,8 @@ class Platform:
                 if command.seq <= applied:
                     continue
         try:
-            records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
+            verified, _audit_report = self.audit.replay_verified(POLICY_STRICT, limit=100_000)
+            records = self.audit.to_records(verified)
         except PlantError:
             return
         trips = [item for item in records if item.action == "trip"]
@@ -713,6 +720,141 @@ class Platform:
             },
             "ok": not mixed and abs(delta - expected) < 1e-9,
         }
+
+    # ---- 流水链与对齐回放 --------------------------------------------
+
+    def _persist_trend_sample(self, signal: str, ts: float, value: float) -> None:
+        """把每个趋势采样同步落进带跨段校验链的趋势流水。"""
+
+        self.trend_journal.append(
+            {"ts": round(float(ts), 3), "signal": signal, "value": round(float(value), 4)}
+        )
+
+    def journal_chains(self) -> dict:
+        """返回审计与趋势两条流水的跨段校验结论。"""
+
+        return {
+            "audit": self.audit.chain_report(),
+            "trend": self.trend_chain.verify().as_dict(),
+        }
+
+    def backfill_segment(
+        self,
+        topic: str,
+        index: int,
+        records: list[dict],
+        *,
+        operator: str = "console",
+    ) -> dict:
+        """补齐一条流水的缺失段。
+
+        补段属于部分失败：链校验器判顺序、锚点与并发重复，平台据此给出
+        ``proceed``/``abort`` 进退；补了什么、依据哪段校验值都落审计，同一
+        段被并发补两次按重复记录，不覆盖已有段。控制台/人工提交的记录可能带着
+        标注读法贴上去的 ``chain_*`` 标记，落盘前剥掉，链哈希只锚原始业务字段。
+        """
+
+        chain, component = self._select_chain(topic)
+        cleaned = []
+        for item in records:
+            plain = {key: value for key, value in item.items() if not key.startswith("chain_")}
+            cleaned.append(plain)
+        outcome = chain.backfill_segment(
+            int(index), cleaned, operator=operator, now=self.clock.now
+        )
+        severity = "notice" if outcome["ok"] else "warning"
+        self.bus.publish(
+            Event.of(
+                "audit",
+                component,
+                "segment_backfill",
+                asset=topic,
+                severity=severity,
+                message=(
+                    f"流水 {topic} 段 {index} 补齐 {outcome['records_installed']} 条"
+                    if outcome["ok"]
+                    else f"流水 {topic} 段 {index} 补段被拒：{outcome['status']}"
+                ),
+                journal=topic,
+                segment=int(index),
+                status=outcome["status"],
+                decision=outcome["decision"],
+                ok=bool(outcome["ok"]),
+                records_installed=outcome["records_installed"],
+                reason=outcome.get("reason", ""),
+                anchor_digest=outcome.get("anchor_digest", ""),
+                anchor_segment=outcome.get("anchor_segment"),
+                operator=operator,
+                missing=list(outcome["chain"]["missing"]),
+                tampered=list(outcome["chain"]["tampered"]),
+            )
+        )
+        return outcome
+
+    def _select_chain(self, topic: str):
+        if topic == "audit":
+            return self.audit.chain, "audit"
+        if topic == "trend":
+            return self.trend_chain, "telemetry"
+        raise PlantError(f"未知流水主题: {topic}", component="store")
+
+    def replay_aligned(
+        self,
+        policy: str = POLICY_MARK,
+        *,
+        limit: int = 100_000,
+        limit_per_axis: int = 5000,
+    ) -> dict:
+        """审计与趋势按同一条时间轴同轴合并回放。
+
+        对齐口径定死为同轴合并：同一时刻审计在前、趋势在后，趋势丢点周期先
+        线性补齐。结果既返回给控制台展示，也原样落一条审计，复盘时两边看到的
+        是同一份有序时间轴；链不完整可信时 ``decision`` 给 ``abort``。
+        """
+
+        if policy not in (POLICY_MARK, POLICY_STRICT):
+            raise ValueError("链读法只能是 strict 或 mark")
+        if policy == POLICY_MARK:
+            audit_records = self.audit.replay_from_journal(limit=limit)
+            audit_report = self.audit.chain.verify()
+        else:
+            audit_records, audit_report = self.audit.replay_verified(POLICY_STRICT, limit=limit)
+        trend_records, trend_report = self.trend_chain.read_verified(policy, limit=limit)
+        # 严格读法成功即说明审计记录可完整还原成对象，恢复路径可直接消费。
+        parsed_audit = parse_audit(audit_records) if policy == POLICY_STRICT else []
+        aligned = build_aligned_replay(
+            audit_records,
+            trend_records,
+            period_s=self.config.quota.sample_period_s,
+            limit_per_axis=limit_per_axis,
+            audit_chain=audit_report,
+            trend_chain=trend_report,
+            policy=policy,
+        )
+        aligned["audit_objects"] = len(parsed_audit)
+        self.bus.publish(
+            Event.of(
+                "audit",
+                "audit",
+                "aligned_replay",
+                severity="notice" if aligned["ok"] else "warning",
+                message=(
+                    "审计与趋势同轴回放完成"
+                    if aligned["ok"]
+                    else "审计与趋势同轴回放存在缺段/改段，按标注部分回放"
+                ),
+                alignment=aligned["alignment"],
+                policy=policy,
+                decision=aligned["decision"],
+                timeline_steps=len(aligned["timeline"]),
+                coverage=dict(aligned["coverage"]),
+                audit_missing=list(audit_report.missing),
+                audit_tampered=list(audit_report.tampered),
+                trend_missing=list(trend_report.missing),
+                trend_tampered=list(trend_report.tampered),
+            )
+        )
+        return aligned
 
     # ---- 查询 ---------------------------------------------------------
 

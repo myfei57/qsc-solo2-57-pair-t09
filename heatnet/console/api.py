@@ -56,6 +56,9 @@ class Api:
         add("GET", "/api/alarms", self._alarms)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/chains", self._chains)
+        add("POST", "/api/backfill", self._backfill)
+        add("POST", "/api/replay-aligned", self._replay_aligned)
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/weather", self._weather)
@@ -222,6 +225,33 @@ class Api:
         if segment is not None:
             payload["records"] = self._platform.audit.replay_segment(int(segment))
         return payload
+
+    def _chains(self, params: dict, body: dict) -> dict:
+        topic = params.get("topic")
+        chains = self._platform.journal_chains()
+        return {"chains": chains} if topic is None else {"chain": chains[str(topic)]}
+
+    def _backfill(self, params: dict, body: dict) -> dict:
+        topic = str(body.get("topic", "audit"))
+        try:
+            segment = int(body["segment"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("segment 必须是非负段号") from error
+        records = body.get("records")
+        if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
+            raise ValueError("补段记录必须是对象数组")
+        outcome = self._platform.backfill_segment(
+            topic,
+            segment,
+            records,
+            operator=str(body.get("operator", "console")),
+        )
+        return outcome
+
+    def _replay_aligned(self, params: dict, body: dict) -> dict:
+        policy = str(body.get("policy", params.get("policy", "mark")))
+        limit = int(body.get("limit", params.get("limit", 100_000)))
+        return self._platform.replay_aligned(policy, limit=limit)
 
     def _store(self, params: dict, body: dict) -> dict:
         return {
